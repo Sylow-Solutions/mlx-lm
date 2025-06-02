@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlx-lm"
+version = "0.24.1"
+description = "LLMs on Apple silicon with MLX and the Hugging Face Hub"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "MLX Contributors", email = "mlx@group.apple.com"}
+]
+maintainers = [
+    {name = "MLX Contributors", email = "mlx@group.apple.com"}
+]
+requires-python = ">=3.8"
+keywords = ["mlx", "llm", "apple", "silicon", "machine learning"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "mlx>=0.25.0",
+    "numpy",
+    "transformers[sentencepiece]>=4.39.3",
+    "protobuf",
+    "pyyaml",
+    "jinja2",
+]
+
+[project.optional-dependencies]
+test = ["datasets"]
+evaluate = ["lm-eval", "tqdm"]
+lwq = ["datasets"]
+
+[project.scripts]
+"mlx_lm.awq" = "mlx_lm.awq:main"
+"mlx_lm.dwq" = "mlx_lm.dwq:main"
+"mlx_lm.cache_prompt" = "mlx_lm.cache_prompt:main"
+"mlx_lm.chat" = "mlx_lm.chat:main"
+"mlx_lm.convert" = "mlx_lm.convert:main"
+"mlx_lm.evaluate" = "mlx_lm.evaluate:main"
+"mlx_lm.fuse" = "mlx_lm.fuse:main"
+"mlx_lm.generate" = "mlx_lm.generate:main"
+"mlx_lm.lora" = "mlx_lm.lora:main"
+"mlx_lm.merge" = "mlx_lm.merge:main"
+"mlx_lm.server" = "mlx_lm.server:main"
+"mlx_lm.manage" = "mlx_lm.manage:main"
+"mlx_lm.upload" = "mlx_lm.upload:main"
+
+[project.urls]
+Homepage = "https://github.com/ml-explore/mlx-lm"
+Repository = "https://github.com/ml-explore/mlx-lm"
+Issues = "https://github.com/ml-explore/mlx-lm/issues"
+
+[tool.setuptools.packages.find]
+include = ["mlx_lm*"]
+
+[tool.setuptools.package-data]
+mlx_lm = ["py.typed"]
