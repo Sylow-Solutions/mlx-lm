@@ -38,6 +38,13 @@ dependencies = [
     "protobuf",
     "pyyaml",
     "jinja2",
+    # OpenTelemetry dependencies
+    "opentelemetry-api>=1.20.0",
+    "opentelemetry-sdk>=1.20.0",
+    "opentelemetry-instrumentation>=0.41b0",
+    "opentelemetry-exporter-otlp>=1.20.0",
+    "opentelemetry-instrumentation-logging>=0.41b0",
+    "structlog>=23.2.0",
 ]
 
 [project.optional-dependencies]

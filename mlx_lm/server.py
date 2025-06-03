@@ -3,6 +3,7 @@
 import argparse
 import json
 import logging
+import os
 import platform
 import socket
 import time
@@ -31,6 +32,98 @@ from .generate import stream_generate
 from .models.cache import can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import common_prefix_len, load
+
+# OpenTelemetry imports
+try:
+    from opentelemetry import trace
+    from opentelemetry.trace import Status, StatusCode
+
+    from .instrumentation import (
+        ErrorCategory,
+        categorize_error,
+        get_logger,
+        get_metrics,
+        get_tracer,
+        init_telemetry,
+        log_with_trace,
+        timer,
+        trace_method,
+        trace_span,
+    )
+
+    TELEMETRY_AVAILABLE = True
+except ImportError:
+    TELEMETRY_AVAILABLE = False
+
+    # Provide no-op implementations
+    def init_telemetry(*args, **kwargs):
+        pass
+
+    def get_logger():
+        return logging.getLogger(__name__)
+
+    def get_metrics():
+        return None
+
+    def get_tracer():
+        return None
+
+    def log_with_trace(level, msg, **kwargs):
+        logging.log(getattr(logging, level.upper()), msg)
+
+    def timer(histogram, attributes=None):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def noop():
+            yield
+
+        return noop()
+
+    def trace_method(span_name=None, attributes=None, record_exception=True):
+        def decorator(func):
+            return func
+
+        return decorator
+
+    def trace_span(name, attributes=None, kind=None):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def noop():
+            yield None
+
+        return noop()
+
+    def categorize_error(e):
+        return "unknown_error"
+
+    class Status:
+        def __init__(self, code, description=""):
+            pass
+
+    class StatusCode:
+        OK = 0
+        ERROR = 1
+
+    trace = type(
+        "trace",
+        (),
+        {
+            "get_current_span": lambda: type(
+                "span",
+                (),
+                {
+                    "set_attributes": lambda self, attrs: None,
+                    "set_attribute": lambda self, k, v: None,
+                    "record_exception": lambda self, e: None,
+                    "set_status": lambda self, s: None,
+                    "is_recording": lambda self: False,
+                },
+            )()
+        },
+    )()
+    TELEMETRY_AVAILABLE = False
 
 
 def get_system_fingerprint():
@@ -160,10 +253,15 @@ class ModelProvider:
         self.model = None
         self.tokenizer = None
         self.draft_model = None
+        self.logger = get_logger()
+        self.metrics = get_metrics() if TELEMETRY_AVAILABLE else None
 
         # Preload the default model if it is provided
         if self.cli_args.model is not None:
-            self.load("default_model", draft_model_path="default_model")
+            with trace_span(
+                "model_provider.init", attributes={"model": self.cli_args.model}
+            ):
+                self.load("default_model", draft_model_path="default_model")
 
     def _validate_model_path(self, model_path: str):
         model_path = Path(model_path)
@@ -173,9 +271,28 @@ class ModelProvider:
             )
 
     # Added in adapter_path to load dynamically
+    @trace_method(span_name="model_provider.load")
     def load(self, model_path, adapter_path=None, draft_model_path=None):
+        span = trace.get_current_span()
+        span.set_attributes(
+            {
+                "model.path": str(model_path),
+                "model.adapter_path": str(adapter_path) if adapter_path else "none",
+                "model.draft_path": (
+                    str(draft_model_path) if draft_model_path else "none"
+                ),
+            }
+        )
+
         if self.model_key == (model_path, adapter_path, draft_model_path):
+            if self.metrics:
+                self.metrics.cache_hits.add(1, {"cache_type": "model"})
+            log_with_trace("info", "Model cache hit", model_key=str(self.model_key))
             return self.model, self.tokenizer
+
+        if self.metrics:
+            self.metrics.cache_misses.add(1, {"cache_type": "model"})
+        log_with_trace("info", "Loading new model", model_path=str(model_path))
 
         # Remove the old model if it exists.
         self.model = None
@@ -190,24 +307,47 @@ class ModelProvider:
         if self.cli_args.chat_template:
             tokenizer_config["chat_template"] = self.cli_args.chat_template
 
-        if model_path == "default_model":
-            if self.cli_args.model is None:
-                raise ValueError(
-                    "A model path has to be given as a CLI "
-                    "argument or in the HTTP request"
+        try:
+            with timer(
+                self.metrics.model_load_duration if self.metrics else None,
+                {"model": str(model_path)},
+            ):
+                if model_path == "default_model":
+                    if self.cli_args.model is None:
+                        raise ValueError(
+                            "A model path has to be given as a CLI "
+                            "argument or in the HTTP request"
+                        )
+                    model, tokenizer = load(
+                        self.cli_args.model,
+                        adapter_path=(
+                            adapter_path if adapter_path else self.cli_args.adapter_path
+                        ),  # if the user doesn't change the model but adds an adapter path
+                        tokenizer_config=tokenizer_config,
+                    )
+                else:
+                    self._validate_model_path(model_path)
+                    model, tokenizer = load(
+                        model_path,
+                        adapter_path=adapter_path,
+                        tokenizer_config=tokenizer_config,
+                    )
+        except Exception as e:
+            error_type = categorize_error(e)
+            if self.metrics:
+                self.metrics.errors.add(
+                    1, {"error_type": error_type, "operation": "model_load"}
                 )
-            model, tokenizer = load(
-                self.cli_args.model,
-                adapter_path=(
-                    adapter_path if adapter_path else self.cli_args.adapter_path
-                ),  # if the user doesn't change the model but adds an adapter path
-                tokenizer_config=tokenizer_config,
+            span.record_exception(e)
+            span.set_status(Status(StatusCode.ERROR, str(e)))
+            log_with_trace(
+                "error",
+                "Failed to load model",
+                model_path=str(model_path),
+                error=str(e),
+                error_type=error_type,
             )
-        else:
-            self._validate_model_path(model_path)
-            model, tokenizer = load(
-                model_path, adapter_path=adapter_path, tokenizer_config=tokenizer_config
-            )
+            raise
 
         if self.cli_args.use_default_chat_template:
             if tokenizer.chat_template is None:
@@ -216,6 +356,14 @@ class ModelProvider:
         self.model_key = (model_path, adapter_path, draft_model_path)
         self.model = model
         self.tokenizer = tokenizer
+
+        # Log successful model load
+        log_with_trace(
+            "info",
+            "Model loaded successfully",
+            model_path=str(model_path),
+            tokenizer_vocab_size=tokenizer.vocab_size,
+        )
 
         def validate_draft_tokenizer(draft_tokenizer):
             # Check if tokenizers are compatible
@@ -256,6 +404,9 @@ class APIHandler(BaseHTTPRequestHandler):
         self.model_provider = model_provider
         self.prompt_cache = prompt_cache or PromptCache()
         self.system_fingerprint = system_fingerprint or get_system_fingerprint()
+        self.logger = get_logger()
+        self.metrics = get_metrics() if TELEMETRY_AVAILABLE else None
+        self.tracer = get_tracer() if TELEMETRY_AVAILABLE else None
         super().__init__(*args, **kwargs)
 
     def _set_cors_headers(self):
@@ -282,88 +433,232 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a POST request from a client.
         """
-        endpoints = {
-            "/v1/completions": self.handle_text_completions,
-            "/v1/chat/completions": self.handle_chat_completions,
-            "/chat/completions": self.handle_chat_completions,
-        }
-
-        if self.path not in endpoints:
-            self._set_completion_headers(404)
-            self.end_headers()
-            self.wfile.write(b"Not Found")
-            return
-
-        # Fetch and parse request body
-        content_length = int(self.headers["Content-Length"])
-        raw_body = self.rfile.read(content_length)
-        self.body = json.loads(raw_body.decode())
-        indent = "\t"  # Backslashes can't be inside of f-strings
-        logging.debug(f"Incoming Request Body: {json.dumps(self.body, indent=indent)}")
-        assert isinstance(
-            self.body, dict
-        ), f"Request should be dict, but got {type(self.body)}"
-
-        # Extract request parameters from the body
-        self.stream = self.body.get("stream", False)
-        self.stream_options = self.body.get("stream_options", None)
-        self.requested_model = self.body.get("model", "default_model")
-        self.requested_draft_model = self.body.get("draft_model", "default_model")
-        self.num_draft_tokens = self.body.get(
-            "num_draft_tokens", self.model_provider.cli_args.num_draft_tokens
-        )
-        self.adapter = self.body.get("adapters", None)
-        self.max_tokens = self.body.get("max_completion_tokens", None)
-        if self.max_tokens is None:
-            self.max_tokens = self.body.get(
-                "max_tokens", self.model_provider.cli_args.max_tokens
+        span_context = (
+            self.tracer.start_as_current_span(
+                "http.request",
+                kind=(
+                    trace.SpanKind.SERVER if hasattr(trace.SpanKind, "SERVER") else None
+                ),
+                attributes={
+                    "http.method": "POST",
+                    "http.url": self.path,
+                    "http.scheme": "http",
+                    "http.host": self.headers.get("Host", "unknown"),
+                    "http.user_agent": self.headers.get("User-Agent", "unknown"),
+                },
             )
-        self.temperature = self.body.get(
-            "temperature", self.model_provider.cli_args.temp
-        )
-        self.top_p = self.body.get("top_p", self.model_provider.cli_args.top_p)
-        self.top_k = self.body.get("top_k", self.model_provider.cli_args.top_k)
-        self.min_p = self.body.get("min_p", self.model_provider.cli_args.min_p)
-        self.repetition_penalty = self.body.get("repetition_penalty", 1.0)
-        self.repetition_context_size = self.body.get("repetition_context_size", 20)
-        self.xtc_probability = self.body.get("xtc_probability", 0.0)
-        self.xtc_threshold = self.body.get("xtc_threshold", 0.0)
-        self.logit_bias = self.body.get("logit_bias", None)
-        self.logprobs = self.body.get("logprobs", -1)
-        self.validate_model_parameters()
-        # Load the model if needed
-        try:
-            self.model, self.tokenizer = self.model_provider.load(
-                self.requested_model,
-                self.adapter,
-                self.requested_draft_model,
-            )
-        except:
-            self._set_completion_headers(404)
-            self.end_headers()
-            self.wfile.write(b"Not Found")
-            return
-
-        # Get stop id sequences, if provided
-        stop_words = self.body.get("stop")
-        stop_words = stop_words or []
-        stop_words = [stop_words] if isinstance(stop_words, str) else stop_words
-        stop_id_sequences = [
-            self.tokenizer.encode(stop_word, add_special_tokens=False)
-            for stop_word in stop_words
-        ]
-
-        # Send header type
-        (
-            self._set_stream_headers(200)
-            if self.stream
-            else self._set_completion_headers(200)
+            if self.tracer
+            else trace_span("http.request")
         )
 
-        # Call endpoint specific method
-        prompt = endpoints[self.path]()
-        self.handle_completion(prompt, stop_id_sequences)
+        with span_context as span:
+            if self.metrics:
+                self.metrics.active_requests.add(1)
+            request_start = time.perf_counter()
 
+            try:
+                endpoints = {
+                    "/v1/completions": self.handle_text_completions,
+                    "/v1/chat/completions": self.handle_chat_completions,
+                    "/chat/completions": self.handle_chat_completions,
+                }
+
+                if self.path not in endpoints:
+                    if self.metrics:
+                        self.metrics.request_counter.add(
+                            1,
+                            {"method": "POST", "endpoint": self.path, "status": "404"},
+                        )
+                    if span:
+                        span.set_attribute("http.status_code", 404)
+                    self._set_completion_headers(404)
+                    self.end_headers()
+                    self.wfile.write(b"Not Found")
+                    return
+
+                # Fetch and parse request body
+                content_length = int(self.headers["Content-Length"])
+                raw_body = self.rfile.read(content_length)
+                if self.metrics:
+                    self.metrics.request_size.record(
+                        content_length, {"endpoint": self.path}
+                    )
+
+                self.body = json.loads(raw_body.decode())
+                indent = "\t"  # Backslashes can't be inside of f-strings
+                log_with_trace(
+                    "debug",
+                    "Incoming request",
+                    endpoint=self.path,
+                    content_length=content_length,
+                    body_preview=str(self.body)[:200],
+                )
+
+                assert isinstance(
+                    self.body, dict
+                ), f"Request should be dict, but got {type(self.body)}"
+
+                # Extract request parameters from the body
+                self.stream = self.body.get("stream", False)
+                self.stream_options = self.body.get("stream_options", None)
+                self.requested_model = self.body.get("model", "default_model")
+                self.requested_draft_model = self.body.get(
+                    "draft_model", "default_model"
+                )
+                self.num_draft_tokens = self.body.get(
+                    "num_draft_tokens", self.model_provider.cli_args.num_draft_tokens
+                )
+                self.adapter = self.body.get("adapters", None)
+                self.max_tokens = self.body.get("max_completion_tokens", None)
+                if self.max_tokens is None:
+                    self.max_tokens = self.body.get(
+                        "max_tokens", self.model_provider.cli_args.max_tokens
+                    )
+                self.temperature = self.body.get(
+                    "temperature", self.model_provider.cli_args.temp
+                )
+                self.top_p = self.body.get("top_p", self.model_provider.cli_args.top_p)
+                self.top_k = self.body.get("top_k", self.model_provider.cli_args.top_k)
+                self.min_p = self.body.get("min_p", self.model_provider.cli_args.min_p)
+                self.repetition_penalty = self.body.get("repetition_penalty", 1.0)
+                self.repetition_context_size = self.body.get(
+                    "repetition_context_size", 20
+                )
+                self.xtc_probability = self.body.get("xtc_probability", 0.0)
+                self.xtc_threshold = self.body.get("xtc_threshold", 0.0)
+                self.logit_bias = self.body.get("logit_bias", None)
+                self.logprobs = self.body.get("logprobs", -1)
+
+                # Add request attributes to span
+                if span:
+                    span.set_attributes(
+                        {
+                            "mlx.model": self.requested_model,
+                            "mlx.stream": self.stream,
+                            "mlx.max_tokens": self.max_tokens,
+                            "mlx.temperature": self.temperature,
+                        }
+                    )
+
+                self.validate_model_parameters()
+
+                # Load the model if needed
+                try:
+                    with trace_span(
+                        "load_model", {"model": self.requested_model}
+                    ) as load_span:
+                        self.model, self.tokenizer = self.model_provider.load(
+                            self.requested_model,
+                            self.adapter,
+                            self.requested_draft_model,
+                        )
+                except Exception as e:
+                    error_type = categorize_error(e)
+                    if self.metrics:
+                        self.metrics.errors.add(
+                            1,
+                            {
+                                "error_type": error_type,
+                                "endpoint": self.path,
+                                "operation": "model_load",
+                            },
+                        )
+                    if span:
+                        span.record_exception(e)
+                        span.set_attribute("http.status_code", 404)
+                    log_with_trace(
+                        "error",
+                        "Model load failed",
+                        model=self.requested_model,
+                        error=str(e),
+                        error_type=error_type,
+                    )
+                    self._set_completion_headers(404)
+                    self.end_headers()
+                    self.wfile.write(b"Not Found")
+                    return
+
+                # Get stop id sequences, if provided
+                stop_words = self.body.get("stop")
+                stop_words = stop_words or []
+                stop_words = [stop_words] if isinstance(stop_words, str) else stop_words
+                stop_id_sequences = [
+                    self.tokenizer.encode(stop_word, add_special_tokens=False)
+                    for stop_word in stop_words
+                ]
+
+                # Send header type
+                (
+                    self._set_stream_headers(200)
+                    if self.stream
+                    else self._set_completion_headers(200)
+                )
+                if span:
+                    span.set_attribute("http.status_code", 200)
+
+                # Call endpoint specific method
+                with trace_span(
+                    "prepare_prompt", {"endpoint": self.path}
+                ) as prompt_span:
+                    prompt = endpoints[self.path]()
+                    if self.metrics:
+                        self.metrics.prompt_tokens.record(
+                            len(prompt),
+                            {"endpoint": self.path, "model": self.requested_model},
+                        )
+
+                self.handle_completion(prompt, stop_id_sequences)
+
+                # Record successful request
+                request_duration = time.perf_counter() - request_start
+                if self.metrics:
+                    self.metrics.request_duration.record(
+                        request_duration,
+                        {
+                            "method": "POST",
+                            "endpoint": self.path,
+                            "status": "200",
+                            "model": self.requested_model,
+                        },
+                    )
+                    self.metrics.request_counter.add(
+                        1, {"method": "POST", "endpoint": self.path, "status": "200"}
+                    )
+                log_with_trace(
+                    "info",
+                    "Request completed",
+                    endpoint=self.path,
+                    duration_ms=request_duration * 1000,
+                    model=self.requested_model,
+                )
+
+            except Exception as e:
+                error_type = categorize_error(e)
+                if self.metrics:
+                    self.metrics.errors.add(
+                        1,
+                        {
+                            "error_type": error_type,
+                            "endpoint": self.path,
+                            "operation": "request_handling",
+                        },
+                    )
+                if span:
+                    span.record_exception(e)
+                    span.set_status(Status(StatusCode.ERROR, str(e)))
+                log_with_trace(
+                    "error",
+                    "Request failed",
+                    endpoint=self.path,
+                    error=str(e),
+                    error_type=error_type,
+                )
+                raise
+            finally:
+                if self.metrics:
+                    self.metrics.active_requests.add(-1)
+
+    @trace_method(span_name="validate_parameters")
     def validate_model_parameters(self):
         """
         Validate the model parameters passed in the request for the correct types and values.
@@ -511,6 +806,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
         return response
 
+    @trace_method(span_name="reset_prompt_cache")
     def reset_prompt_cache(self, prompt):
         """Resets the prompt cache and associated state.
 
@@ -518,7 +814,7 @@ class APIHandler(BaseHTTPRequestHandler):
             prompt (List[int]): The tokenized new prompt which will populate the
                 reset cache.
         """
-        logging.debug(f"*** Resetting cache. ***")
+        log_with_trace("debug", "Resetting prompt cache", prompt_length=len(prompt))
         self.prompt_cache.model_key = self.model_provider.model_key
         self.prompt_cache.cache = make_prompt_cache(self.model_provider.model)
         if self.model_provider.draft_model is not None:
@@ -527,6 +823,7 @@ class APIHandler(BaseHTTPRequestHandler):
             )
         self.prompt_cache.tokens = list(prompt)  # Cache the new prompt fully
 
+    @trace_method(span_name="get_prompt_cache")
     def get_prompt_cache(self, prompt):
         """
         Determines the portion of the prompt that needs processing by comparing
@@ -545,6 +842,8 @@ class APIHandler(BaseHTTPRequestHandler):
                        by the model. This will be the full prompt if the cache is
                        reset or cannot be effectively used.
         """
+        span = trace.get_current_span()
+        span.set_attribute("prompt.length", len(prompt))
         cache_len = len(self.prompt_cache.tokens)
         prompt_len = len(prompt)
         com_prefix_len = common_prefix_len(self.prompt_cache.tokens, prompt)
@@ -557,43 +856,77 @@ class APIHandler(BaseHTTPRequestHandler):
             self.prompt_cache.model_key != self.model_provider.model_key
             or com_prefix_len == 0
         ):
+            if self.metrics:
+                self.metrics.cache_misses.add(
+                    1, {"cache_type": "prompt", "reason": "no_prefix"}
+                )
+            span.set_attribute("cache.hit", False)
+            span.set_attribute("cache.reason", "no_prefix")
             self.reset_prompt_cache(prompt)
 
         # Condition 2: Common prefix exists and matches cache length. Process suffix.
         elif com_prefix_len == cache_len:
-            logging.debug(
-                f"*** Cache is prefix of prompt (cache_len: {cache_len}, prompt_len: {prompt_len}). Processing suffix. ***"
+            if self.metrics:
+                self.metrics.cache_hits.add(1, {"cache_type": "prompt"})
+            span.set_attribute("cache.hit", True)
+            span.set_attribute("cache.common_prefix_len", com_prefix_len)
+            log_with_trace(
+                "debug",
+                "Cache hit - processing suffix",
+                cache_len=cache_len,
+                prompt_len=prompt_len,
+                suffix_len=prompt_len - com_prefix_len,
             )
             prompt = prompt[com_prefix_len:]
             self.prompt_cache.tokens.extend(prompt)
 
         # Condition 3: Common prefix exists but is shorter than cache length. Attempt trim.
         elif com_prefix_len < cache_len:
-            logging.debug(
-                f"*** Common prefix ({com_prefix_len}) shorter than cache ({cache_len}). Attempting trim. ***"
+            log_with_trace(
+                "debug",
+                "Common prefix shorter than cache",
+                common_prefix_len=com_prefix_len,
+                cache_len=cache_len,
             )
 
             if can_trim_prompt_cache(self.prompt_cache.cache):
                 num_to_trim = cache_len - com_prefix_len
-                logging.debug(f"    Trimming {num_to_trim} tokens from cache.")
+                if self.metrics:
+                    self.metrics.cache_hits.add(
+                        1, {"cache_type": "prompt", "operation": "trim"}
+                    )
+                span.set_attribute("cache.hit", True)
+                span.set_attribute("cache.trim_tokens", num_to_trim)
+                log_with_trace("debug", "Trimming cache", tokens_to_trim=num_to_trim)
                 trim_prompt_cache(self.prompt_cache.cache, num_to_trim)
                 self.prompt_cache.tokens = self.prompt_cache.tokens[:com_prefix_len]
                 prompt = prompt[com_prefix_len:]
                 self.prompt_cache.tokens.extend(prompt)
             else:
-                logging.debug(f"    Cache cannot be trimmed. Resetting cache.")
+                if self.metrics:
+                    self.metrics.cache_misses.add(
+                        1, {"cache_type": "prompt", "reason": "cannot_trim"}
+                    )
+                span.set_attribute("cache.hit", False)
+                span.set_attribute("cache.reason", "cannot_trim")
+                log_with_trace("debug", "Cache cannot be trimmed - resetting")
                 self.reset_prompt_cache(prompt)
 
         # This case should logically not be reached if com_prefix_len <= cache_len
         else:
-            logging.error(
-                f"Unexpected cache state: com_prefix_len ({com_prefix_len}) > cache_len ({cache_len}). Resetting cache."
+            log_with_trace(
+                "error",
+                "Unexpected cache state",
+                common_prefix_len=com_prefix_len,
+                cache_len=cache_len,
             )
             self.reset_prompt_cache(prompt)
 
-        logging.debug(f"Returning {len(prompt)} tokens for processing.")
+        span.set_attribute("prompt.tokens_to_process", len(prompt))
+        log_with_trace("debug", "Prompt cache processed", tokens_to_process=len(prompt))
         return prompt
 
+    @trace_method(span_name="handle_completion")
     def handle_completion(
         self,
         prompt: List[int],
@@ -607,14 +940,22 @@ class APIHandler(BaseHTTPRequestHandler):
             stop_id_sequences (List[List[int]]): A list of stop words passed
               to the stopping_criteria function
         """
+        span = trace.get_current_span()
+        span.set_attributes(
+            {
+                "prompt.length": len(prompt),
+                "stop_sequences.count": len(stop_id_sequences),
+                "stream": self.stream,
+            }
+        )
         tokens = []
         finish_reason = "length"
         stop_sequence_suffix = None
         if self.stream:
             self.end_headers()
-            logging.debug(f"Starting stream:")
+            log_with_trace("debug", "Starting stream generation")
         else:
-            logging.debug(f"Starting completion:")
+            log_with_trace("debug", "Starting completion generation")
         token_logprobs = []
         top_tokens = []
 
@@ -640,23 +981,32 @@ class APIHandler(BaseHTTPRequestHandler):
             self.repetition_context_size,
         )
 
-        for gen_response in stream_generate(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            prompt=prompt,
-            max_tokens=self.max_tokens,
-            sampler=sampler,
-            logits_processors=logits_processors,
-            prompt_cache=self.prompt_cache.cache,
-            draft_model=self.model_provider.draft_model,
-            num_draft_tokens=self.num_draft_tokens,
-        ):
-            segment = gen_response.text
-            text += segment
-            logging.debug(segment)
-            token = gen_response.token
-            logprobs = gen_response.logprobs
-            tokens.append(token)
+        inference_timer = (
+            timer(
+                self.metrics.inference_duration,
+                {"model": self.requested_model, "stream": self.stream},
+            )
+            if self.metrics
+            else trace_span("inference")
+        )
+
+        with inference_timer:
+            for gen_response in stream_generate(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                prompt=prompt,
+                max_tokens=self.max_tokens,
+                sampler=sampler,
+                logits_processors=logits_processors,
+                prompt_cache=self.prompt_cache.cache,
+                draft_model=self.model_provider.draft_model,
+                num_draft_tokens=self.num_draft_tokens,
+            ):
+                segment = gen_response.text
+                text += segment
+                token = gen_response.token
+                logprobs = gen_response.logprobs
+                tokens.append(token)
 
             if self.logprobs > 0:
                 sorted_indices = mx.argpartition(-logprobs, kth=self.logprobs - 1)
@@ -696,9 +1046,39 @@ class APIHandler(BaseHTTPRequestHandler):
 
         self.prompt_cache.tokens.extend(tokens)
 
-        logging.debug(f"Prompt: {gen_response.prompt_tps:.3f} tokens-per-sec")
-        logging.debug(f"Generation: {gen_response.generation_tps:.3f} tokens-per-sec")
-        logging.debug(f"Peak memory: {gen_response.peak_memory:.3f} GB")
+        # Record generation metrics
+        if self.metrics:
+            self.metrics.tokens_generated.record(
+                len(tokens),
+                {"model": self.requested_model, "finish_reason": finish_reason},
+            )
+            self.metrics.tokens_per_second.record(
+                gen_response.generation_tps, {"model": self.requested_model}
+            )
+            self.metrics.peak_memory.record(
+                gen_response.peak_memory * 1e9,
+                {"model": self.requested_model},  # Convert GB to bytes
+            )
+
+        span.set_attributes(
+            {
+                "tokens.generated": len(tokens),
+                "tokens.prompt_tps": gen_response.prompt_tps,
+                "tokens.generation_tps": gen_response.generation_tps,
+                "memory.peak_gb": gen_response.peak_memory,
+                "finish_reason": finish_reason,
+            }
+        )
+
+        log_with_trace(
+            "info",
+            "Generation completed",
+            prompt_tps=gen_response.prompt_tps,
+            generation_tps=gen_response.generation_tps,
+            peak_memory_gb=gen_response.peak_memory,
+            tokens_generated=len(tokens),
+            finish_reason=finish_reason,
+        )
 
         if self.stream:
             response = self.generate_response(segment, finish_reason)
@@ -721,8 +1101,19 @@ class APIHandler(BaseHTTPRequestHandler):
                 tokens=tokens,
             )
             response_json = json.dumps(response).encode()
-            indent = "\t"  # Backslashes can't be inside of f-strings
-            logging.debug(f"Outgoing Response: {json.dumps(response, indent=indent)}")
+            if self.metrics:
+                self.metrics.response_size.record(
+                    len(response_json),
+                    {"endpoint": self.path, "model": self.requested_model},
+                )
+
+            log_with_trace(
+                "debug",
+                "Sending completion response",
+                response_size=len(response_json),
+                prompt_tokens=len(prompt),
+                completion_tokens=len(tokens),
+            )
 
             # Send an additional Content-Length header when it is known
             self.send_header("Content-Length", str(len(response_json)))
@@ -750,6 +1141,7 @@ class APIHandler(BaseHTTPRequestHandler):
         }
         return response
 
+    @trace_method(span_name="handle_chat_completions")
     def handle_chat_completions(self) -> List[int]:
         """
         Handle a chat completion request.
@@ -778,6 +1170,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
         return prompt
 
+    @trace_method(span_name="handle_text_completions")
     def handle_text_completions(self) -> List[int]:
         """
         Handle a text completion request.
@@ -795,14 +1188,57 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a GET request from a client.
         """
-        if self.path == "/v1/models":
-            self.handle_models_request()
-        elif self.path == "/health":
-            self.handle_health_check()
-        else:
-            self._set_completion_headers(404)
-            self.end_headers()
-            self.wfile.write(b"Not Found")
+        span_context = (
+            self.tracer.start_as_current_span(
+                "http.request",
+                kind=(
+                    trace.SpanKind.SERVER if hasattr(trace.SpanKind, "SERVER") else None
+                ),
+                attributes={
+                    "http.method": "GET",
+                    "http.url": self.path,
+                    "http.scheme": "http",
+                },
+            )
+            if self.tracer
+            else trace_span("http.request")
+        )
+
+        with span_context as span:
+            try:
+                if self.path == "/v1/models":
+                    self.handle_models_request()
+                    if span:
+                        span.set_attribute("http.status_code", 200)
+                elif self.path == "/health":
+                    self.handle_health_check()
+                    if span:
+                        span.set_attribute("http.status_code", 200)
+                else:
+                    if span:
+                        span.set_attribute("http.status_code", 404)
+                    self._set_completion_headers(404)
+                    self.end_headers()
+                    self.wfile.write(b"Not Found")
+
+                if self.metrics:
+                    self.metrics.request_counter.add(
+                        1,
+                        {
+                            "method": "GET",
+                            "endpoint": self.path,
+                            "status": str(
+                                span.attributes.get("http.status_code", "unknown")
+                                if span
+                                else "200"
+                            ),
+                        },
+                    )
+            except Exception as e:
+                if span:
+                    span.record_exception(e)
+                    span.set_status(Status(StatusCode.ERROR, str(e)))
+                raise
 
     def handle_health_check(self):
         """
@@ -861,31 +1297,48 @@ def run(
     server_class=HTTPServer,
     handler_class=APIHandler,
 ):
-    server_address = (host, port)
-    prompt_cache = PromptCache()
-    infos = socket.getaddrinfo(
-        *server_address, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
-    )
-    server_class.address_family, _, _, _, server_address = next(iter(infos))
-    httpd = server_class(
-        server_address,
-        lambda *args, **kwargs: handler_class(
-            model_provider,
-            prompt_cache=prompt_cache,
+    logger = get_logger()
+
+    with trace_span("server.startup", attributes={"host": host, "port": port}) as span:
+        server_address = (host, port)
+        prompt_cache = PromptCache()
+        infos = socket.getaddrinfo(
+            *server_address, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+        )
+        server_class.address_family, _, _, _, server_address = next(iter(infos))
+        httpd = server_class(
+            server_address,
+            lambda *args, **kwargs: handler_class(
+                model_provider,
+                prompt_cache=prompt_cache,
+                system_fingerprint=get_system_fingerprint(),
+                *args,
+                **kwargs,
+            ),
+        )
+        warnings.warn(
+            "mlx_lm.server is not recommended for production as "
+            "it only implements basic security checks."
+        )
+        log_with_trace(
+            "info",
+            "MLX server started",
+            host=host,
+            port=port,
             system_fingerprint=get_system_fingerprint(),
-            *args,
-            **kwargs,
-        ),
-    )
-    warnings.warn(
-        "mlx_lm.server is not recommended for production as "
-        "it only implements basic security checks."
-    )
-    logging.info(f"Starting httpd at {host} on port {port}...")
+        )
+
     httpd.serve_forever()
 
 
 def main():
+    # Initialize OpenTelemetry early
+    if TELEMETRY_AVAILABLE:
+        init_telemetry(
+            service_name=os.getenv("OTEL_SERVICE_NAME", "mlx-service"),
+            service_version=os.getenv("OTEL_SERVICE_VERSION", "1.0.0"),
+        )
+
     parser = argparse.ArgumentParser(description="MLX Http Server.")
     parser.add_argument(
         "--model",
@@ -983,11 +1436,18 @@ def main():
     )
     args = parser.parse_args()
 
+    # Configure standard logging to work with structlog
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), None),
-        format="%(asctime)s - %(levelname)s - %(message)s",
+        format="%(message)s",
+        handlers=[logging.StreamHandler()],
     )
-    run(args.host, args.port, ModelProvider(args))
+
+    # Suppress verbose logging from some libraries
+    logging.getLogger("opentelemetry").setLevel(logging.WARNING)
+
+    with trace_span("main", attributes={"args": str(args)}) as span:
+        run(args.host, args.port, ModelProvider(args))
 
 
 if __name__ == "__main__":
