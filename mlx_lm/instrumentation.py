@@ -237,14 +237,15 @@ class MLXMetrics:
             unit="By",
         )
 
-    def _observe_memory_usage(self, options: CallbackOptions) -> Observation:
+    def _observe_memory_usage(self, options: CallbackOptions):
         """Callback to observe current memory usage."""
         if mx.metal.is_available():
             # Get memory info from MLX
             memory_info = mx.metal.device_info()
             used = memory_info.get("peak_allocated_size", 0)
-            return Observation(used)
-        return Observation(0)
+            yield Observation(used)
+        else:
+            yield Observation(0)
 
 
 # Global metrics instance
