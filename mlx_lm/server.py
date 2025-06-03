@@ -1008,41 +1008,41 @@ class APIHandler(BaseHTTPRequestHandler):
                 logprobs = gen_response.logprobs
                 tokens.append(token)
 
-            if self.logprobs > 0:
-                sorted_indices = mx.argpartition(-logprobs, kth=self.logprobs - 1)
-                top_indices = sorted_indices[: self.logprobs]
-                top_logprobs = logprobs[top_indices]
-                top_token_info = zip(top_indices.tolist(), top_logprobs.tolist())
-                top_tokens.append(tuple(top_token_info))
+                if self.logprobs > 0:
+                    sorted_indices = mx.argpartition(-logprobs, kth=self.logprobs - 1)
+                    top_indices = sorted_indices[: self.logprobs]
+                    top_logprobs = logprobs[top_indices]
+                    top_token_info = zip(top_indices.tolist(), top_logprobs.tolist())
+                    top_tokens.append(tuple(top_token_info))
 
-            token_logprobs.append(logprobs[token].item())
+                token_logprobs.append(logprobs[token].item())
 
-            stop_condition = stopping_criteria(
-                tokens, stop_id_sequences, self.tokenizer.eos_token_id
-            )
-            if stop_condition.stop_met:
-                finish_reason = "stop"
-                if stop_condition.trim_length:
-                    stop_sequence_suffix = self.tokenizer.decode(
-                        tokens[-stop_condition.trim_length :]
-                    )
-                    text = text[: -len(stop_sequence_suffix)]
-                break
+                stop_condition = stopping_criteria(
+                    tokens, stop_id_sequences, self.tokenizer.eos_token_id
+                )
+                if stop_condition.stop_met:
+                    finish_reason = "stop"
+                    if stop_condition.trim_length:
+                        stop_sequence_suffix = self.tokenizer.decode(
+                            tokens[-stop_condition.trim_length :]
+                        )
+                        text = text[: -len(stop_sequence_suffix)]
+                    break
 
-            if self.stream:
-                # If the end of tokens overlaps with a stop sequence, generate new
-                # tokens until we know if the stop sequence is hit or not
-                if any(
-                    (
-                        sequence_overlap(tokens, sequence)
-                        for sequence in stop_id_sequences
-                    )
-                ):
-                    continue
-                elif segment:
-                    response = self.generate_response(segment, None)
-                    self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
-                    self.wfile.flush()
+                if self.stream:
+                    # If the end of tokens overlaps with a stop sequence, generate new
+                    # tokens until we know if the stop sequence is hit or not
+                    if any(
+                        (
+                            sequence_overlap(tokens, sequence)
+                            for sequence in stop_id_sequences
+                        )
+                    ):
+                        continue
+                    elif segment:
+                        response = self.generate_response(segment, None)
+                        self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
+                        self.wfile.flush()
 
         self.prompt_cache.tokens.extend(tokens)
 
