@@ -137,6 +137,22 @@ class Qwen3Model(nn.Module):
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
+    def pipeline(self, group):
+        # Split layers in reverse so rank=0 gets the last layers and
+        # rank=pipeline_size-1 gets the first
+        self.pipeline_rank = group.rank()
+        self.pipeline_size = group.size()
+        layers_per_rank = len(self.layers) // self.pipeline_size
+        extra = len(self.layers) - layers_per_rank * self.pipeline_size
+        if self.pipeline_rank < extra:
+            layers_per_rank += 1
+
+        self.start_idx = (self.pipeline_size - self.pipeline_rank - 1) * layers_per_rank
+        self.end_idx = self.start_idx + layers_per_rank
+        self.layers = self.layers[: self.end_idx]
+        self.layers[: self.start_idx] = [None] * self.start_idx
+        self.num_layers = len(self.layers) - self.start_idx
+
     def __call__(
         self,
         inputs: mx.array,
@@ -145,14 +161,28 @@ class Qwen3Model(nn.Module):
     ):
         h = self.embed_tokens(inputs)
 
+        pipeline_rank = getattr(self, "pipeline_rank", 0)
+        pipeline_size = getattr(self, "pipeline_size", 1)
+
         if mask is None:
             mask = create_attention_mask(h, cache)
 
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * getattr(self, "num_layers", len(self.layers))
 
-        for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, c)
+        # Receive from the previous process in the pipeline
+        if pipeline_rank < pipeline_size - 1:
+            h = mx.distributed.recv_like(h, (pipeline_rank + 1))
+
+        for i in range(getattr(self, "num_layers", len(self.layers))):
+            h = self.layers[getattr(self, "start_idx", 0) + i](h, mask, cache[i])
+
+        # Send to the next process in the pipeline
+        if pipeline_rank != 0:
+            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
+
+        # Broadcast h while keeping it in the graph
+        h = mx.distributed.all_gather(h)[: h.shape[0]]
 
         return self.norm(h)
 
@@ -186,4 +216,8 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.layers[
+            getattr(self.model, "start_idx", 0) : getattr(
+                self.model, "end_idx", len(self.model.layers)
+            )
+        ]
